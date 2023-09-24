@@ -1,0 +1,88 @@
+# Define function directory
+ARG FUNCTION_DIR="/function"
+
+# Build Stage
+FROM --platform=arm64 ubuntu:22.04 AS build
+ENV DEBIAN_FRONTEND noninteractive
+
+ARG FOUNDATIONMODEL="https://huggingface.co/justinpinkney/miniSD/resolve/main/miniSD.ckpt"
+
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    g++ \
+    make \
+    cmake \
+    unzip \
+    libcurl4-openssl-dev \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3.10-venv \
+    wget \
+    git
+
+# Clone the repository and perform the quantization
+WORKDIR /opt
+RUN git clone --recursive https://github.com/leejet/stable-diffusion.cpp
+WORKDIR /opt/stable-diffusion.cpp/models
+RUN wget -O foundationmodel.ckpt ${FOUNDATIONMODEL} && \
+    bash -c "python3 -m venv venv && source venv/bin/activate && pip3 install -r requirements.txt && python3 convert.py foundationmodel.ckpt --out_type q4_0 && deactivate" && \
+    mv foundationmodel-ggml-model-q4_0.bin /opt/modelfile.bin
+
+# Build the binary executable
+WORKDIR /opt/stable-diffusion.cpp
+RUN rm -rf models && \
+    mkdir build
+WORKDIR /opt/stable-diffusion.cpp/build
+RUN cmake .. && \
+    cmake --build . --config Release
+
+# Final Stage
+FROM --platform=arm64 ubuntu:22.04 AS final
+ENV DEBIAN_FRONTEND noninteractive
+ARG FUNCTION_DIR
+
+# Copy necessary files from build stage
+COPY --from=build /opt/modelfile.bin /opt/modelfile.bin
+COPY --from=build /opt/stable-diffusion.cpp/build/bin/sd /opt/stable-diffusion.cpp/build/bin/sd
+
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
+    python3.10-venv \
+    git\
+    g++ \
+    make \
+    cmake \
+    unzip \
+    libcurl4-openssl-dev \
+    python3-pip && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set up the runtime environment
+RUN mkdir -p ${FUNCTION_DIR}
+WORKDIR ${FUNCTION_DIR}
+COPY main.py .
+COPY requirements.txt .
+RUN pip3 install -r requirements.txt --target "${FUNCTION_DIR}" && \
+    pip3 install awslambdaric
+
+# Set up xbrz.py
+RUN git clone https://github.com/ioistired/xbrz.py.git /xbrz.py
+WORKDIR /xbrz.py
+RUN pip3 install pillow && \
+    pip3 install .
+
+# Set up environment variables
+ENV MODELPATH /opt/modelfile.bin
+ENV SDPATH /opt/stable-diffusion.cpp/build/bin/sd
+ENV IMAGE_DIMENSION 256
+
+# Set working directory to function root directory
+WORKDIR ${FUNCTION_DIR}
+ENTRYPOINT [ "/usr/bin/python3", "-m", "awslambdaric" ]
+CMD [ "main.handler" ]
